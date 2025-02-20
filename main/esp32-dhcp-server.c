@@ -17,6 +17,13 @@
 #include "lwip/ip_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/pbuf.h"
+#include "lwip/netif.h"
+#include "lwip/etharp.h"
+#include "lwip/err.h"
+#include "esp_netif_private.h"
+extern struct netif *esp_netif_get_netif_impl(esp_netif_t *esp_netif);
+
 
 static const char *TAG = "CUSTOM_DHCP_SERVER";
 
@@ -44,6 +51,9 @@ static wifi_config_data_t wifi_config_data = {
     .ssid = "Default_SSID",
     .password = "Default_Password"
 };
+
+/* Global pointer to AP netif (used for sending ARP) */
+static esp_netif_t *g_ap_netif = NULL;
 
 /* Mount LittleFS from partition "assets" at /assets */
 static esp_err_t mount_littlefs(void)
@@ -198,7 +208,7 @@ typedef struct __attribute__((packed)) {
     uint8_t chaddr[16];
     char sname[64];
     char file[128];
-    uint8_t options[312]; // Options field (variable length in reality)
+    uint8_t options[312]; // Options field
 } dhcp_packet_t;
 
 /* DHCP Message Types */
@@ -208,13 +218,12 @@ typedef struct __attribute__((packed)) {
 #define DHCPACK      5
 
 /* Parse DHCP Message Type (Option 53) from options.
-   Expects that the first 4 bytes of options are the magic cookie. */
+   Expects the first 4 bytes to be the magic cookie (0x63, 0x82, 0x53, 0x63). */
 static int get_dhcp_message_type(const uint8_t *options, size_t length) {
     if (length < 4) {
         ESP_LOGE(TAG, "Options length too short");
         return -1;
     }
-    /* Check for magic cookie: 0x63, 0x82, 0x53, 0x63 */
     if (!(options[0] == 0x63 && options[1] == 0x82 &&
           options[2] == 0x53 && options[3] == 0x63)) {
         ESP_LOGE(TAG, "Magic cookie not found in DHCP options");
@@ -252,32 +261,90 @@ static void build_dhcp_reply(const dhcp_packet_t *request, dhcp_packet_t *reply,
     memset(reply->sname, 0, sizeof(reply->sname));
     memset(reply->file, 0, sizeof(reply->file));
     uint8_t *opt = reply->options;
-    /* Insert magic cookie */
-    memcpy(opt, "\x63\x82\x53\x63", 4);
+    memcpy(opt, "\x63\x82\x53\x63", 4); // Magic cookie
     opt += 4;
-    /* DHCP Message Type Option */
-    *opt++ = 53; *opt++ = 1; *opt++ = dhcp_msg_type;
-    /* Server Identifier Option */
-    *opt++ = 54; *opt++ = 4;
+    *opt++ = 53; *opt++ = 1; *opt++ = dhcp_msg_type; // DHCP Message Type
+    *opt++ = 54; *opt++ = 4; // Server Identifier
     uint32_t server_ip = inet_addr("192.168.4.1");
     memcpy(opt, &server_ip, 4); opt += 4;
-    /* IP Address Lease Time Option */
-    *opt++ = 51; *opt++ = 4;
+    *opt++ = 51; *opt++ = 4; // IP Address Lease Time
     uint32_t lease_time = htonl(3600);
     memcpy(opt, &lease_time, 4); opt += 4;
-    /* Subnet Mask Option */
-    *opt++ = 1; *opt++ = 4;
+    *opt++ = 1; *opt++ = 4; // Subnet Mask
     uint32_t subnet_mask = inet_addr("255.255.255.0");
     memcpy(opt, &subnet_mask, 4); opt += 4;
-    /* Router Option */
-    *opt++ = 3; *opt++ = 4;
+    *opt++ = 3; *opt++ = 4; // Router
     memcpy(opt, &server_ip, 4); opt += 4;
-    /* End Option */
-    *opt++ = 255;
+    *opt++ = 255; // End option
 }
 
 /* Global dynamic IP counter (in network byte order) */
 static uint32_t dynamic_ip_current;
+
+/* --- Begin Gratuitous ARP Function --- */
+/* This function crafts and sends a gratuitous ARP reply announcing the offered IP for the client */
+static void send_gratuitous_arp(uint32_t offered_ip, const uint8_t *client_mac, esp_netif_t *ap_netif) {
+    #define ETH_HDR_LEN 14
+    #define ARP_HDR_LEN 28
+    #define ARP_PKT_LEN (ETH_HDR_LEN + ARP_HDR_LEN)
+    uint8_t arp_pkt[ARP_PKT_LEN];
+    memset(arp_pkt, 0, sizeof(arp_pkt));
+
+    /* Ethernet header */
+    struct eth_hdr {
+        uint8_t dest[6];
+        uint8_t src[6];
+        uint16_t type;
+    } __attribute__((packed));
+    struct eth_hdr *eth = (struct eth_hdr *)arp_pkt;
+    memset(eth->dest, 0xff, 6);         // Broadcast
+    memcpy(eth->src, client_mac, 6);      // Client's MAC as source
+    eth->type = htons(0x0806);            // ARP EtherType
+
+    /* ARP header */
+    struct arp_hdr {
+        uint16_t hwtype;
+        uint16_t proto;
+        uint8_t hwlen;
+        uint8_t protolen;
+        uint16_t opcode;
+        uint8_t shwaddr[6];
+        uint8_t sipaddr[4];
+        uint8_t thwaddr[6];
+        uint8_t tipaddr[4];
+    } __attribute__((packed));
+    struct arp_hdr *arp = (struct arp_hdr *)(arp_pkt + ETH_HDR_LEN);
+    arp->hwtype = htons(1);              // Ethernet
+    arp->proto = htons(0x0800);           // IPv4
+    arp->hwlen = 6;
+    arp->protolen = 4;
+    arp->opcode = htons(2);              // ARP Reply
+    memcpy(arp->shwaddr, client_mac, 6);  // Sender hardware address = client's MAC
+    memcpy(arp->sipaddr, &offered_ip, 4);   // Sender IP = offered IP
+    memcpy(arp->thwaddr, client_mac, 6);  // Target hardware address = client's MAC
+    memcpy(arp->tipaddr, &offered_ip, 4);   // Target IP = offered IP
+
+    /* Obtain lwIP netif pointer from esp_netif_t pointer */
+    struct netif *lwip_netif = esp_netif_get_netif_impl(ap_netif);
+    if (lwip_netif == NULL) {
+        ESP_LOGE(TAG, "Failed to get lwIP netif");
+        return;
+    }
+    struct pbuf *p = pbuf_alloc(PBUF_RAW, ARP_PKT_LEN, PBUF_POOL);
+    if (!p) {
+        ESP_LOGE(TAG, "Failed to allocate pbuf for ARP packet");
+        return;
+    }
+    pbuf_take(p, arp_pkt, ARP_PKT_LEN);
+    err_t err = lwip_netif->linkoutput(lwip_netif, p);
+    if (err != ERR_OK) {
+        ESP_LOGE(TAG, "Failed to send gratuitous ARP, err: %d", err);
+    } else {
+        ESP_LOGI(TAG, "Sent gratuitous ARP for IP: %s", inet_ntoa(*(struct in_addr *)&offered_ip));
+    }
+    pbuf_free(p);
+}
+/* --- End Gratuitous ARP Function --- */
 
 /* Custom DHCP server task: listens on UDP port 67, processes DHCP requests, and replies */
 static void dhcp_server_task(void *pvParameters) {
@@ -286,7 +353,7 @@ static void dhcp_server_task(void *pvParameters) {
     socklen_t addr_len = sizeof(client_addr);
     dhcp_packet_t packet;
     char offered_ip_str[16];
-    int header_size = 236; // Size of DHCP header (up to options)
+    int header_size = 236; // Fixed DHCP header size
 
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -354,14 +421,20 @@ static void dhcp_server_task(void *pvParameters) {
 
         sendto(sock, &reply, sizeof(reply), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         ESP_LOGI(TAG, "Sent DHCP reply with offered IP: %s", inet_ntop(AF_INET, &offered_ip, offered_ip_str, sizeof(offered_ip_str)));
+
+        /* Send gratuitous ARP to announce the IP-to-MAC mapping */
+        if (g_ap_netif != NULL) {
+            send_gratuitous_arp(offered_ip, client_mac, g_ap_netif);
+        }
     }
     close(sock);
     vTaskDelete(NULL);
 }
 
-/* Initialize Wi‑Fi in AP mode and stop built-in DHCP server */
+/* Initialize Wi‑Fi in AP mode and stop the built-in DHCP server */
 static void wifi_init_softap(void) {
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    g_ap_netif = ap_netif; // Store global pointer for ARP
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -370,7 +443,7 @@ static void wifi_init_softap(void) {
     wifi_config.ap.ssid_len = strlen(wifi_config_data.ssid);
     strncpy((char *)wifi_config.ap.password, wifi_config_data.password, sizeof(wifi_config.ap.password));
     wifi_config.ap.channel = 1;
-    wifi_config.ap.max_connection = 4;
+    wifi_config.ap.max_connection = 32;
     wifi_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     if (strlen(wifi_config_data.password) == 0) {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
@@ -382,7 +455,7 @@ static void wifi_init_softap(void) {
 
     ESP_LOGI(TAG, "SoftAP started. SSID: %s, Password: %s", wifi_config_data.ssid, wifi_config_data.password);
 
-    /* Stop built-in DHCP server so our custom server can use port 67 */
+    /* Stop the built-in DHCP server so our custom server can use port 67 */
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
     ESP_LOGI(TAG, "Built-in DHCP server stopped.");
 }
