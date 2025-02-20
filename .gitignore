@@ -1,0 +1,10 @@
+
+assets/dhcp_reservations_sample.json
+assets/wifi_config_sample.json
+build/
+build.*/
+managed_components/
+dependencies.lock
+sdkconfig
+
+
