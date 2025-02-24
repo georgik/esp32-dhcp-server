@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "lwip/dns.h"            // For DNS (if needed)
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -22,12 +23,13 @@
 #include "lwip/etharp.h"
 #include "lwip/err.h"
 #include "esp_netif_private.h"
-extern struct netif *esp_netif_get_netif_impl(esp_netif_t *esp_netif);
 
+extern struct netif *esp_netif_get_netif_impl(esp_netif_t *esp_netif);
 
 static const char *TAG = "CUSTOM_DHCP_SERVER";
 
 #define MAX_RESERVATIONS 10
+#define MAX_DYNAMIC_LEASES 32
 
 /* Reservation table entry: client MAC and reserved IP */
 typedef struct {
@@ -41,19 +43,24 @@ static int reservation_count = 0;
 #define WIFI_CONFIG_FILE "/assets/wifi_config.json"
 #define DHCP_RESERVATIONS_FILE "/assets/dhcp_reservations.json"
 
-/* Wi‑Fi credentials structure */
+/* Define our own AP configuration type to avoid conflict */
 typedef struct {
     char ssid[32];
     char password[64];
-} wifi_config_data_t;
+} my_ap_config_t;
 
-static wifi_config_data_t wifi_config_data = {
+static my_ap_config_t wifi_ap_config = {
     .ssid = "Default_SSID",
     .password = "Default_Password"
 };
 
-/* Global pointer to AP netif (used for sending ARP) */
+/* STA (parent/upstream) credentials will be loaded from JSON as well */
+static char sta_ssid[32] = "Default_STA_SSID";
+static char sta_password[64] = "Default_STA_Password";
+
+/* Global pointers to AP and STA netifs */
 static esp_netif_t *g_ap_netif = NULL;
+static esp_netif_t *g_sta_netif = NULL;
 
 /* Mount LittleFS from partition "assets" at /assets */
 static esp_err_t mount_littlefs(void)
@@ -74,7 +81,8 @@ static esp_err_t mount_littlefs(void)
     return ret;
 }
 
-/* Load Wi‑Fi configuration from JSON file */
+/* Load Wi‑Fi configuration from JSON file.
+   The JSON file contains two objects: "ap" and "sta". */
 static esp_err_t load_wifi_config(void)
 {
     FILE *f = fopen(WIFI_CONFIG_FILE, "r");
@@ -82,7 +90,7 @@ static esp_err_t load_wifi_config(void)
         ESP_LOGE(TAG, "Failed to open %s, using default config", WIFI_CONFIG_FILE);
         return ESP_FAIL;
     }
-    char buffer[256];
+    char buffer[512];
     size_t bytes_read = fread(buffer, 1, sizeof(buffer) - 1, f);
     buffer[bytes_read] = '\0';
     fclose(f);
@@ -94,18 +102,35 @@ static esp_err_t load_wifi_config(void)
         return ESP_FAIL;
     }
 
-    cJSON *ssid = cJSON_GetObjectItemCaseSensitive(json, "ssid");
-    cJSON *password = cJSON_GetObjectItemCaseSensitive(json, "password");
-
-    if (cJSON_IsString(ssid) && (ssid->valuestring != NULL)) {
-        strncpy(wifi_config_data.ssid, ssid->valuestring, sizeof(wifi_config_data.ssid) - 1);
+    // Parse AP configuration
+    cJSON *ap = cJSON_GetObjectItemCaseSensitive(json, "ap");
+    if (cJSON_IsObject(ap)) {
+        cJSON *ap_ssid = cJSON_GetObjectItemCaseSensitive(ap, "ssid");
+        cJSON *ap_password = cJSON_GetObjectItemCaseSensitive(ap, "password");
+        if (cJSON_IsString(ap_ssid) && (ap_ssid->valuestring != NULL)) {
+            strncpy(wifi_ap_config.ssid, ap_ssid->valuestring, sizeof(wifi_ap_config.ssid) - 1);
+        }
+        if (cJSON_IsString(ap_password) && (ap_password->valuestring != NULL)) {
+            strncpy(wifi_ap_config.password, ap_password->valuestring, sizeof(wifi_ap_config.password) - 1);
+        }
     }
-    if (cJSON_IsString(password) && (password->valuestring != NULL)) {
-        strncpy(wifi_config_data.password, password->valuestring, sizeof(wifi_config_data.password) - 1);
+
+    // Parse STA (parent) configuration
+    cJSON *sta = cJSON_GetObjectItemCaseSensitive(json, "sta");
+    if (cJSON_IsObject(sta)) {
+        cJSON *s_ssid = cJSON_GetObjectItemCaseSensitive(sta, "ssid");
+        cJSON *s_password = cJSON_GetObjectItemCaseSensitive(sta, "password");
+        if (cJSON_IsString(s_ssid) && (s_ssid->valuestring != NULL)) {
+            strncpy(sta_ssid, s_ssid->valuestring, sizeof(sta_ssid) - 1);
+        }
+        if (cJSON_IsString(s_password) && (s_password->valuestring != NULL)) {
+            strncpy(sta_password, s_password->valuestring, sizeof(sta_password) - 1);
+        }
     }
 
     cJSON_Delete(json);
-    ESP_LOGI(TAG, "Loaded WiFi config: SSID=%s, Password=%s", wifi_config_data.ssid, wifi_config_data.password);
+    ESP_LOGI(TAG, "Loaded WiFi AP config: SSID=%s, Password=%s", wifi_ap_config.ssid, wifi_ap_config.password);
+    ESP_LOGI(TAG, "Loaded WiFi STA config: SSID=%s, Password=%s", sta_ssid, sta_password);
     return ESP_OK;
 }
 
@@ -192,6 +217,40 @@ ip4_addr_t get_reserved_ip_for_client(const uint8_t *client_mac)
     return reserved_ip;
 }
 
+/* Dynamic lease table for non-reserved clients */
+typedef struct {
+    uint8_t mac[6];
+    uint32_t ip; // in network order
+} dynamic_lease_t;
+
+static dynamic_lease_t dynamic_leases[MAX_DYNAMIC_LEASES] = {0};
+
+static uint32_t get_dynamic_lease(const uint8_t *client_mac) {
+    for (int i = 0; i < MAX_DYNAMIC_LEASES; i++) {
+        if (memcmp(dynamic_leases[i].mac, client_mac, 6) == 0) {
+            return dynamic_leases[i].ip;
+        }
+    }
+    return 0;
+}
+
+static void set_dynamic_lease(const uint8_t *client_mac, uint32_t ip) {
+    for (int i = 0; i < MAX_DYNAMIC_LEASES; i++) {
+        if (memcmp(dynamic_leases[i].mac, client_mac, 6) == 0) {
+            dynamic_leases[i].ip = ip;
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_DYNAMIC_LEASES; i++) {
+        if (dynamic_leases[i].ip == 0) {
+            memcpy(dynamic_leases[i].mac, client_mac, 6);
+            dynamic_leases[i].ip = ip;
+            return;
+        }
+    }
+}
+
+
 /* DHCP packet structure (RFC 2131) */
 typedef struct __attribute__((packed)) {
     uint8_t op;       /* Message op code: 1 = BOOTREQUEST, 2 = BOOTREPLY */
@@ -218,7 +277,7 @@ typedef struct __attribute__((packed)) {
 #define DHCPACK      5
 
 /* Parse DHCP Message Type (Option 53) from options.
-   Expects the first 4 bytes to be the magic cookie (0x63, 0x82, 0x53, 0x63). */
+   Expects the first 4 bytes to be the magic cookie (0x63,0x82,0x53,0x63). */
 static int get_dhcp_message_type(const uint8_t *options, size_t length) {
     if (length < 4) {
         ESP_LOGE(TAG, "Options length too short");
@@ -244,8 +303,8 @@ static int get_dhcp_message_type(const uint8_t *options, size_t length) {
     return -1;
 }
 
-/* Build a DHCP reply packet based on the request, offered IP, and reply type */
-static void build_dhcp_reply(const dhcp_packet_t *request, dhcp_packet_t *reply, uint32_t offered_ip, uint8_t dhcp_msg_type) {
+/* Build a DHCP reply packet and return total packet length */
+static size_t build_dhcp_reply(const dhcp_packet_t *request, dhcp_packet_t *reply, uint32_t offered_ip, uint8_t dhcp_msg_type) {
     reply->op = 2; // BOOTREPLY
     reply->htype = request->htype;
     reply->hlen = request->hlen;
@@ -260,22 +319,61 @@ static void build_dhcp_reply(const dhcp_packet_t *request, dhcp_packet_t *reply,
     memcpy(reply->chaddr, request->chaddr, 16);
     memset(reply->sname, 0, sizeof(reply->sname));
     memset(reply->file, 0, sizeof(reply->file));
+
     uint8_t *opt = reply->options;
-    memcpy(opt, "\x63\x82\x53\x63", 4); // Magic cookie
+    // Start with magic cookie
+    memcpy(opt, "\x63\x82\x53\x63", 4);
     opt += 4;
-    *opt++ = 53; *opt++ = 1; *opt++ = dhcp_msg_type; // DHCP Message Type
-    *opt++ = 54; *opt++ = 4; // Server Identifier
+
+    // Echo Option 61 (Client Identifier) if present in request.
+    // For simplicity, if not present, include our own using htype (1) and client MAC.
+    // (A production DHCP server would parse the incoming options for 61.)
+    *opt++ = 61;   // Option 61: Client Identifier
+    *opt++ = 7;    // Length: 1 (type) + 6 (MAC)
+    *opt++ = 1;    // Ethernet type
+    memcpy(opt, request->chaddr, 6);
+    opt += 6;
+
+    // DHCP Message Type (Option 53)
+    *opt++ = 53; *opt++ = 1; *opt++ = dhcp_msg_type;
+    // Server Identifier (Option 54)
+    *opt++ = 54; *opt++ = 4;
     uint32_t server_ip = inet_addr("192.168.4.1");
     memcpy(opt, &server_ip, 4); opt += 4;
-    *opt++ = 51; *opt++ = 4; // IP Address Lease Time
+    // Lease Time (Option 51)
+    *opt++ = 51; *opt++ = 4;
     uint32_t lease_time = htonl(3600);
     memcpy(opt, &lease_time, 4); opt += 4;
-    *opt++ = 1; *opt++ = 4; // Subnet Mask
+    // Renewal Time (Option 58) at 50%
+    *opt++ = 58; *opt++ = 4;
+    uint32_t renewal_time = htonl(1800);
+    memcpy(opt, &renewal_time, 4); opt += 4;
+    // Rebinding Time (Option 59) at ~87.5%
+    *opt++ = 59; *opt++ = 4;
+    uint32_t rebinding_time = htonl(3150);
+    memcpy(opt, &rebinding_time, 4); opt += 4;
+    // Subnet Mask (Option 1)
+    *opt++ = 1; *opt++ = 4;
     uint32_t subnet_mask = inet_addr("255.255.255.0");
     memcpy(opt, &subnet_mask, 4); opt += 4;
-    *opt++ = 3; *opt++ = 4; // Router
+    // Router (Option 3)
+    *opt++ = 3; *opt++ = 4;
     memcpy(opt, &server_ip, 4); opt += 4;
-    *opt++ = 255; // End option
+    // DNS Server (Option 6)
+    *opt++ = 6; *opt++ = 4;
+    esp_netif_dns_info_t dns_info;
+    if (esp_netif_get_dns_info(g_sta_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK) {
+         memcpy(opt, &dns_info.ip.u_addr.ip4.addr, 4);
+         opt += 4;
+    } else {
+         uint32_t default_dns = inet_addr("8.8.8.8");
+         memcpy(opt, &default_dns, 4); opt += 4;
+    }
+    // End option marker
+    *opt++ = 255;
+
+    size_t options_len = (size_t)(opt - reply->options);
+    return 236 + options_len; // 236 bytes DHCP header plus options
 }
 
 /* Global dynamic IP counter (in network byte order) */
@@ -298,7 +396,7 @@ static void send_gratuitous_arp(uint32_t offered_ip, const uint8_t *client_mac, 
     } __attribute__((packed));
     struct eth_hdr *eth = (struct eth_hdr *)arp_pkt;
     memset(eth->dest, 0xff, 6);         // Broadcast
-    memcpy(eth->src, client_mac, 6);      // Client's MAC as source
+    memcpy(eth->src, client_mac, 6);      // Use client MAC as source for announcement
     eth->type = htons(0x0806);            // ARP EtherType
 
     /* ARP header */
@@ -319,10 +417,10 @@ static void send_gratuitous_arp(uint32_t offered_ip, const uint8_t *client_mac, 
     arp->hwlen = 6;
     arp->protolen = 4;
     arp->opcode = htons(2);              // ARP Reply
-    memcpy(arp->shwaddr, client_mac, 6);  // Sender hardware address = client's MAC
-    memcpy(arp->sipaddr, &offered_ip, 4);   // Sender IP = offered IP
-    memcpy(arp->thwaddr, client_mac, 6);  // Target hardware address = client's MAC
-    memcpy(arp->tipaddr, &offered_ip, 4);   // Target IP = offered IP
+    memcpy(arp->shwaddr, client_mac, 6);  // Sender MAC
+    memcpy(arp->sipaddr, &offered_ip, 4);  // Sender IP
+    memcpy(arp->thwaddr, client_mac, 6);   // Target MAC
+    memcpy(arp->tipaddr, &offered_ip, 4);   // Target IP
 
     /* Obtain lwIP netif pointer from esp_netif_t pointer */
     struct netif *lwip_netif = esp_netif_get_netif_impl(ap_netif);
@@ -346,14 +444,24 @@ static void send_gratuitous_arp(uint32_t offered_ip, const uint8_t *client_mac, 
 }
 /* --- End Gratuitous ARP Function --- */
 
+static void log_hex(const char *title, const uint8_t *data, size_t len) {
+    char buf[256] = {0};
+    size_t pos = 0;
+    for (size_t i = 0; i < len && pos < sizeof(buf)-3; i++) {
+        pos += sprintf(buf + pos, "%02X ", data[i]);
+    }
+    ESP_LOGI(TAG, "%s: %s", title, buf);
+}
+
 /* Custom DHCP server task: listens on UDP port 67, processes DHCP requests, and replies */
 static void dhcp_server_task(void *pvParameters) {
     int sock;
-    struct sockaddr_in server_addr, client_addr;
+    struct sockaddr_in server_addr, client_addr, dest_addr;
     socklen_t addr_len = sizeof(client_addr);
     dhcp_packet_t packet;
+    dhcp_packet_t reply;
     char offered_ip_str[16];
-    int header_size = 236; // Fixed DHCP header size
+    const int header_size = 236; // Fixed DHCP header size
 
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -376,6 +484,11 @@ static void dhcp_server_task(void *pvParameters) {
     }
     ESP_LOGI(TAG, "Custom DHCP server started");
 
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(68);
+    dest_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
     while (1) {
         int len = recvfrom(sock, &packet, sizeof(packet), 0,
                            (struct sockaddr *)&client_addr, &addr_len);
@@ -387,8 +500,8 @@ static void dhcp_server_task(void *pvParameters) {
             ESP_LOGE(TAG, "Received packet too short: %d bytes", len);
             continue;
         }
-        size_t options_len = len - header_size;
-        int msg_type = get_dhcp_message_type(packet.options, options_len);
+        size_t req_options_len = len - header_size;
+        int msg_type = get_dhcp_message_type(packet.options, req_options_len);
         if (msg_type < 0) {
             ESP_LOGE(TAG, "DHCP message type not found");
             continue;
@@ -404,23 +517,29 @@ static void dhcp_server_task(void *pvParameters) {
         if (!ip4_addr_isany_val(reserved)) {
             offered_ip = reserved.addr;
         } else {
-            offered_ip = dynamic_ip_current;
-            dynamic_ip_current = htonl(ntohl(dynamic_ip_current) + 1);
+            offered_ip = get_dynamic_lease(client_mac);
+            if (offered_ip == 0) {
+                offered_ip = dynamic_ip_current;
+                set_dynamic_lease(client_mac, offered_ip);
+                dynamic_ip_current = htonl(ntohl(dynamic_ip_current) + 1);
+            }
         }
 
-        dhcp_packet_t reply;
         memset(&reply, 0, sizeof(reply));
+        // If the incoming message is DHCPDISCOVER (type 1) then send an OFFER (type 2),
+        // otherwise if it's a DHCPREQUEST (type 3) then send an ACK (type 5).
         uint8_t reply_type = (msg_type == DHCPDISCOVER) ? DHCPOFFER : DHCPACK;
-        build_dhcp_reply(&packet, &reply, offered_ip, reply_type);
-
-        struct sockaddr_in dest_addr;
-        memset(&dest_addr, 0, sizeof(dest_addr));
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(68);
-        dest_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-
-        sendto(sock, &reply, sizeof(reply), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        size_t reply_len = build_dhcp_reply(&packet, &reply, offered_ip, reply_type);
+        // Force the broadcast flag so the client can receive the reply
+        reply.flags = htons(0x8000);
+        // Pad reply to at least 300 bytes
+        if (reply_len < 300) {
+            reply_len = 300;
+        }
+        ESP_LOGI(TAG, "Sending DHCP reply with length %d bytes", (int)reply_len);
+        sendto(sock, &reply, reply_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         ESP_LOGI(TAG, "Sent DHCP reply with offered IP: %s", inet_ntop(AF_INET, &offered_ip, offered_ip_str, sizeof(offered_ip_str)));
+        log_hex("DHCP Reply Packet", (uint8_t *)&reply, reply_len);
 
         /* Send gratuitous ARP to announce the IP-to-MAC mapping */
         if (g_ap_netif != NULL) {
@@ -431,31 +550,51 @@ static void dhcp_server_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-/* Initialize Wi‑Fi in AP mode and stop the built-in DHCP server */
-static void wifi_init_softap(void) {
+/* Initialize Wi‑Fi in AP+STA mode.
+   The AP configuration is taken from the loaded JSON.
+   The STA (parent) configuration is also taken from the JSON.
+   NAT and routing require CONFIG_LWIP_IP_FORWARD and CONFIG_LWIP_NAPT enabled in menuconfig.
+*/
+static void wifi_init_ap_sta(void) {
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
     g_ap_netif = ap_netif; // Store global pointer for ARP
+    g_sta_netif = sta_netif; // Store STA pointer for DNS retrieval
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.ap.ssid, wifi_config_data.ssid, sizeof(wifi_config.ap.ssid));
-    wifi_config.ap.ssid_len = strlen(wifi_config_data.ssid);
-    strncpy((char *)wifi_config.ap.password, wifi_config_data.password, sizeof(wifi_config.ap.password));
-    wifi_config.ap.channel = 1;
-    wifi_config.ap.max_connection = 32;
-    wifi_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
-    if (strlen(wifi_config_data.password) == 0) {
-        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    // Configure AP using loaded configuration:
+    wifi_config_t wifi_config_ap = {0};
+    strncpy((char *)wifi_config_ap.ap.ssid, wifi_ap_config.ssid, sizeof(wifi_config_ap.ap.ssid));
+    wifi_config_ap.ap.ssid_len = strlen(wifi_ap_config.ssid);
+    strncpy((char *)wifi_config_ap.ap.password, wifi_ap_config.password, sizeof(wifi_config_ap.ap.password));
+    wifi_config_ap.ap.channel = 1;
+    wifi_config_ap.ap.max_connection = 32;
+    wifi_config_ap.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    if (strlen(wifi_ap_config.password) == 0) {
+        wifi_config_ap.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    // Configure STA using loaded parent credentials:
+    wifi_config_t wifi_config_sta = {0};
+    strncpy((char *)wifi_config_sta.sta.ssid, sta_ssid, sizeof(wifi_config_sta.sta.ssid));
+    strncpy((char *)wifi_config_sta.sta.password, sta_password, sizeof(wifi_config_sta.sta.password));
+    // Additional STA settings can be configured here if needed
+
+    // Set mode to AP+STA:
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config_ap));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config_sta));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "SoftAP started. SSID: %s, Password: %s", wifi_config_data.ssid, wifi_config_data.password);
+    // Connect STA:
+    ESP_ERROR_CHECK(esp_wifi_connect());
 
-    /* Stop the built-in DHCP server so our custom server can use port 67 */
+    ESP_LOGI(TAG, "AP+STA mode started. AP SSID: %s, AP Password: %s", wifi_ap_config.ssid, wifi_ap_config.password);
+    ESP_LOGI(TAG, "STA connecting to: %s", sta_ssid);
+
+    /* Stop the built-in DHCP server on the AP interface so our custom server can use port 67 */
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
     ESP_LOGI(TAG, "Built-in DHCP server stopped.");
 }
@@ -478,11 +617,11 @@ void app_main(void) {
     load_wifi_config();
     load_dhcp_reservations();
 
-    wifi_init_softap();
+    wifi_init_ap_sta();
 
     /* Initialize dynamic IP pool starting at 192.168.4.2 */
     dynamic_ip_current = inet_addr("192.168.4.2");
 
-    /* Start the custom DHCP server task */
+    /* Start the custom DHCP server task on the AP interface */
     xTaskCreate(dhcp_server_task, "dhcp_server_task", 4096, NULL, 5, NULL);
 }

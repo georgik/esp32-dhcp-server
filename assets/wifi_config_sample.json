@@ -1,5 +1,10 @@
 {
-  "ssid": "MyESP32AP",
-  "password": "MySecretPass"
+    "ap": {
+        "ssid": "ESP32-AP",
+        "password": "ap_password"
+    },
+    "sta": {
+        "ssid": "Parent_WiFi_SSID",
+        "password": "Parent_WiFi_Password"
+    }
 }
-
