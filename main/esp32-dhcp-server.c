@@ -6,6 +6,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "lwip/dns.h"            // For DNS (if needed)
+#include "lwip/lwip_napt.h"        // Include NAT API
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -550,7 +551,6 @@ static void dhcp_server_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-
 /* Initialize Wi‑Fi in AP+STA mode.
    The AP configuration is taken from the loaded JSON.
    The STA (parent) configuration is also taken from the JSON.
@@ -559,8 +559,11 @@ static void dhcp_server_task(void *pvParameters) {
 static void wifi_init_ap_sta(void) {
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
     esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-    g_ap_netif = ap_netif; // Store global pointer for ARP
-    g_sta_netif = sta_netif; // Store STA pointer for DNS retrieval
+    g_ap_netif = ap_netif; // Store global pointer for AP
+    g_sta_netif = sta_netif; // Store global pointer for STA
+
+    // Set the STA interface as the default so that outbound traffic is routed via STA
+    esp_netif_set_default_netif(g_sta_netif);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -581,7 +584,7 @@ static void wifi_init_ap_sta(void) {
     wifi_config_t wifi_config_sta = {0};
     strncpy((char *)wifi_config_sta.sta.ssid, sta_ssid, sizeof(wifi_config_sta.sta.ssid));
     strncpy((char *)wifi_config_sta.sta.password, sta_password, sizeof(wifi_config_sta.sta.password));
-    // Additional STA settings can be configured here if needed
+    // Additional STA settings if needed
 
     // Set mode to AP+STA:
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
@@ -598,6 +601,22 @@ static void wifi_init_ap_sta(void) {
     /* Stop the built-in DHCP server on the AP interface so our custom server can use port 67 */
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
     ESP_LOGI(TAG, "Built-in DHCP server stopped.");
+
+    // Wait for the STA to get an IP (or register for IP_EVENT_STA_GOT_IP in production)
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // Enable NAT on the STA interface:
+    struct netif *sta_netif_impl = esp_netif_get_netif_impl(g_sta_netif);
+    if (sta_netif_impl) {
+        int nat_enabled = ip_napt_enable_netif(sta_netif_impl, 1);
+        if (nat_enabled == 1) {
+            ESP_LOGI(TAG, "NAT enabled on STA interface");
+        } else {
+            ESP_LOGE(TAG, "Failed to enable NAT on STA interface");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to get STA netif for NAT enabling");
+    }
 }
 
 /* Main entry point */
