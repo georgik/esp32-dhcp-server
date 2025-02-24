@@ -314,22 +314,20 @@ static size_t build_dhcp_reply(const dhcp_packet_t *request, dhcp_packet_t *repl
     reply->flags = request->flags;
     reply->ciaddr = 0;
     reply->yiaddr = offered_ip;
-    reply->siaddr = inet_addr("192.168.4.1"); // Server IP
+    reply->siaddr = inet_addr("192.168.4.1"); // Server IP (AP IP)
     reply->giaddr = 0;
     memcpy(reply->chaddr, request->chaddr, 16);
     memset(reply->sname, 0, sizeof(reply->sname));
     memset(reply->file, 0, sizeof(reply->file));
 
     uint8_t *opt = reply->options;
-    // Start with magic cookie
+    // Magic cookie
     memcpy(opt, "\x63\x82\x53\x63", 4);
     opt += 4;
 
-    // Echo Option 61 (Client Identifier) if present in request.
-    // For simplicity, if not present, include our own using htype (1) and client MAC.
-    // (A production DHCP server would parse the incoming options for 61.)
-    *opt++ = 61;   // Option 61: Client Identifier
-    *opt++ = 7;    // Length: 1 (type) + 6 (MAC)
+    // Echo Option 61 (Client Identifier)
+    *opt++ = 61;   // Option 61
+    *opt++ = 7;    // Length: 1 + 6 bytes MAC
     *opt++ = 1;    // Ethernet type
     memcpy(opt, request->chaddr, 6);
     opt += 6;
@@ -344,11 +342,11 @@ static size_t build_dhcp_reply(const dhcp_packet_t *request, dhcp_packet_t *repl
     *opt++ = 51; *opt++ = 4;
     uint32_t lease_time = htonl(3600);
     memcpy(opt, &lease_time, 4); opt += 4;
-    // Renewal Time (Option 58) at 50%
+    // Renewal Time (Option 58) - 50% of lease
     *opt++ = 58; *opt++ = 4;
     uint32_t renewal_time = htonl(1800);
     memcpy(opt, &renewal_time, 4); opt += 4;
-    // Rebinding Time (Option 59) at ~87.5%
+    // Rebinding Time (Option 59) - 87.5% of lease
     *opt++ = 59; *opt++ = 4;
     uint32_t rebinding_time = htonl(3150);
     memcpy(opt, &rebinding_time, 4); opt += 4;
@@ -359,21 +357,15 @@ static size_t build_dhcp_reply(const dhcp_packet_t *request, dhcp_packet_t *repl
     // Router (Option 3)
     *opt++ = 3; *opt++ = 4;
     memcpy(opt, &server_ip, 4); opt += 4;
-    // DNS Server (Option 6)
+    // DNS Server (Option 6) -- Use 8.8.8.8 so that it is reachable
     *opt++ = 6; *opt++ = 4;
-    esp_netif_dns_info_t dns_info;
-    if (esp_netif_get_dns_info(g_sta_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK) {
-         memcpy(opt, &dns_info.ip.u_addr.ip4.addr, 4);
-         opt += 4;
-    } else {
-         uint32_t default_dns = inet_addr("8.8.8.8");
-         memcpy(opt, &default_dns, 4); opt += 4;
-    }
-    // End option marker
+    uint32_t dns_ip = inet_addr("8.8.8.8");
+    memcpy(opt, &dns_ip, 4); opt += 4;
+    // End Option
     *opt++ = 255;
 
     size_t options_len = (size_t)(opt - reply->options);
-    return 236 + options_len; // 236 bytes DHCP header plus options
+    return 236 + options_len; // Total length: DHCP header (236) + options
 }
 
 /* Global dynamic IP counter (in network byte order) */
@@ -463,6 +455,15 @@ static void dhcp_server_task(void *pvParameters) {
     char offered_ip_str[16];
     const int header_size = 236; // Fixed DHCP header size
 
+    // Obtain the AP interface IP info so we can bind the socket to the AP's IP.
+    esp_netif_ip_info_t ap_ip_info = {0};
+    if (esp_netif_get_ip_info(g_ap_netif, &ap_ip_info) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get AP IP info");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "AP IP info: " IPSTR, IP2STR(&ap_ip_info.ip));
+
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         ESP_LOGE(TAG, "Failed to create socket");
@@ -474,15 +475,16 @@ static void dhcp_server_task(void *pvParameters) {
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    // Bind explicitly to the AP IP address
+    server_addr.sin_addr.s_addr = ap_ip_info.ip.addr;
     server_addr.sin_port = htons(67);
     if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        ESP_LOGE(TAG, "Failed to bind socket");
+        ESP_LOGE(TAG, "Failed to bind socket on AP IP");
         close(sock);
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Custom DHCP server started");
+    ESP_LOGI(TAG, "Custom DHCP server bound to AP IP");
 
     memset(&dest_addr, 0, sizeof(dest_addr));
     dest_addr.sin_family = AF_INET;
@@ -526,11 +528,9 @@ static void dhcp_server_task(void *pvParameters) {
         }
 
         memset(&reply, 0, sizeof(reply));
-        // If the incoming message is DHCPDISCOVER (type 1) then send an OFFER (type 2),
-        // otherwise if it's a DHCPREQUEST (type 3) then send an ACK (type 5).
         uint8_t reply_type = (msg_type == DHCPDISCOVER) ? DHCPOFFER : DHCPACK;
         size_t reply_len = build_dhcp_reply(&packet, &reply, offered_ip, reply_type);
-        // Force the broadcast flag so the client can receive the reply
+        // Force broadcast flag
         reply.flags = htons(0x8000);
         // Pad reply to at least 300 bytes
         if (reply_len < 300) {
@@ -549,6 +549,7 @@ static void dhcp_server_task(void *pvParameters) {
     close(sock);
     vTaskDelete(NULL);
 }
+
 
 /* Initialize Wi‑Fi in AP+STA mode.
    The AP configuration is taken from the loaded JSON.
